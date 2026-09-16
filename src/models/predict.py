@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import pandas as pd
 
 # The four base columns that get a signed-log1p companion feature, in the
 # exact order engineering.py iterates over them.
@@ -222,7 +223,7 @@ class PredictionTool:
                     reason=f"Missing required features: {missing}",
                 )
 
-            row = [[features[f] for f in self.features]]
+            row = pd.DataFrame([{f: features[f] for f in self.features}])
             pred = self.model.predict(row)[0]
             proba = None
             if hasattr(self.model, "predict_proba"):
