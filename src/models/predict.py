@@ -2,16 +2,27 @@
 Prediction tool: wraps the classical repeat-purchase model artifact so the
 agent can call it as a third tool alongside SQL and RAG.
 
-Design choice: rather than waiting on a hand-off ("send me the function
-signature"), this loads models/<name>.joblib + models/<name>.json and
-introspects the metadata json for the feature list, target name and
-reported metrics. If a team member changes the model later, as long as the
-.json sidecar has a "features": [...] key (or the joblib model exposes
-sklearn's feature_names_in_), this keeps working with no code changes here.
+Feature source: the model expects nine "first order" features
+(first_order_revenue, first_order_quantity, first_order_avg_price,
+first_order_unique_products, first_order_lines, and log1p_ versions of the
+first four). These are computed LIVE from orders + order_items for a given
+customer_id, replicating src/features/engineering.py's
+build_repeat_purchase_dataset() exactly:
 
-    tool = PredictionTool.from_artifact("models/classical_repeat_purchase_rf_v1")
-    tool.predict(features={"recency_days": 12, "frequency": 4, ...})
-    tool.predict(customer_id="12583")   # looks the row up in the DB instead
+  * "first order" = the customer's earliest invoice by invoice_date
+    (ties broken by invoice number), matching the pandas sort in
+    engineering.py — Cancelled orders are NOT excluded here, because
+    engineering.py's _clean_columns() does not filter them out either.
+    This differs from the is_cancelled = 0 convention used elsewhere in
+    the SQL tool / analytics_guidelines.md. That inconsistency is real
+    and should be called out in the report, not silently "fixed" here,
+    since silently filtering cancellations would make live predictions
+    diverge from what the model was actually trained on.
+  * first_order_avg_price = AVG(unit_price) across that invoice's line
+    items (unweighted mean, matching pandas .agg(("Price", "mean"))).
+  * log1p transform is SIGNED: sign(x) * log1p(abs(x)), applied to
+    revenue/quantity/avg_price/lines only (not unique_products) —
+    matching engineering.py's loop exactly.
 
 Drop this file at: src/models/predict.py
 """
@@ -19,12 +30,27 @@ Drop this file at: src/models/predict.py
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import joblib
+
+# The four base columns that get a signed-log1p companion feature, in the
+# exact order engineering.py iterates over them.
+_LOG1P_BASE_COLUMNS = (
+    "first_order_revenue",
+    "first_order_quantity",
+    "first_order_avg_price",
+    "first_order_lines",
+)
+
+
+def _signed_log1p(x: float) -> float:
+    sign = -1.0 if x < 0 else (1.0 if x > 0 else 0.0)
+    return sign * math.log1p(abs(x))
 
 
 @dataclass
@@ -97,32 +123,78 @@ class PredictionTool:
         metric_str = ", ".join(f"{k}={v}" for k, v in self.metrics.items()) or "n/a"
         return (
             f"Predicts '{self.target}' for a customer using a trained "
-            f"classical model (version {self.model_version}). "
-            f"Required features: {', '.join(self.features)}. "
+            f"classical model (version {self.model_version}), based only "
+            f"on that customer's FIRST observed order. "
             f"Reported offline metrics: {metric_str}. "
             "Use this tool when the question asks to predict, forecast, or "
             "estimate the likelihood of a customer's FUTURE behavior "
-            "(e.g. repeat purchase, churn) rather than report a historical "
+            "(e.g. repeat purchase) rather than report a historical "
             "fact (use sql) or a definition (use rag)."
         )
 
     # ------------------------------------------------------------------ #
     def _fetch_features_for_customer(self, customer_id: str) -> dict[str, Any]:
-        """Pulls a feature row from the customer_features table so the tool
-        can be called from natural language with just a customer id.
-        Assumes a customer_features table/view exists in the SQLite db with
-        at minimum a customer_id column plus this model's feature columns
-        (this mirrors the spark/customer_features feature-store output)."""
+        """Computes the nine "first order" features live from orders +
+        order_items, replicating engineering.py's
+        build_repeat_purchase_dataset() for a single customer."""
         if not self.db_path or not Path(self.db_path).exists():
             raise RuntimeError("No database configured to look up customer features.")
-        cols = ", ".join(self.features)
-        query = f"SELECT {cols} FROM customer_features WHERE customer_id = ?"
+
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(query, (customer_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"No feature row found for customer_id={customer_id!r}")
-        return {k: row[k] for k in self.features}
+
+            # "first order" = earliest invoice_date for this customer,
+            # ties broken by invoice_no. Intentionally NOT filtering
+            # is_cancelled, to match engineering.py's training behavior.
+            first_invoice_row = conn.execute(
+                """
+                SELECT invoice_no
+                FROM orders
+                WHERE customer_id = ?
+                ORDER BY invoice_date ASC, invoice_no ASC
+                LIMIT 1
+                """,
+                (customer_id,),
+            ).fetchone()
+
+            if first_invoice_row is None:
+                raise KeyError(f"No orders found for customer_id={customer_id!r}")
+
+            first_invoice_no = first_invoice_row["invoice_no"]
+
+            agg_row = conn.execute(
+                """
+                SELECT
+                    SUM(oi.revenue)                    AS first_order_revenue,
+                    SUM(oi.quantity)                   AS first_order_quantity,
+                    AVG(oi.unit_price)                 AS first_order_avg_price,
+                    COUNT(DISTINCT oi.stock_code)       AS first_order_unique_products,
+                    COUNT(*)                            AS first_order_lines
+                FROM order_items oi
+                WHERE oi.invoice_no = ?
+                """,
+                (first_invoice_no,),
+            ).fetchone()
+
+        if agg_row is None or agg_row["first_order_lines"] == 0:
+            raise KeyError(
+                f"No order_items found for customer_id={customer_id!r}'s "
+                f"first invoice ({first_invoice_no!r})."
+            )
+
+        base = {
+            "first_order_revenue": float(agg_row["first_order_revenue"] or 0.0),
+            "first_order_quantity": float(agg_row["first_order_quantity"] or 0.0),
+            "first_order_avg_price": float(agg_row["first_order_avg_price"] or 0.0),
+            "first_order_unique_products": float(agg_row["first_order_unique_products"] or 0.0),
+            "first_order_lines": float(agg_row["first_order_lines"] or 0.0),
+        }
+        for col in _LOG1P_BASE_COLUMNS:
+            base[f"log1p_{col}"] = _signed_log1p(base[col])
+
+        # Only return what the model actually asks for, in case the
+        # metadata's feature list is a subset/superset for some reason.
+        return {f: base[f] for f in self.features if f in base}
 
     # ------------------------------------------------------------------ #
     def predict(
