@@ -16,3 +16,8 @@ retail.db
 # Caches
 .pytest_cache/
 .DS_Store
+
+models/vector_index/
+reports/agent_audit.jsonl
+reports/agent_evaluation.json
+reports/agent_evaluation.csv
