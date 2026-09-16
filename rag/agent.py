@@ -8,12 +8,24 @@ never produces a final number on its own. The flow is always
       -> input screening (security.check_user_input)
       -> routing          (LLM router, deterministic rule fallback)
       -> tool execution   (SQL: generate -> validate -> execute
-                           RAG: retrieve -> sanitize)
+                           RAG: retrieve -> sanitize
+                           Prediction: load features -> run model)
       -> grounded answer  (LLM writes prose over tool evidence only)
       -> audit log + structured result
 
 Every branch returns the same result dict so Member 6's Streamlit app can
 render it without special-casing.
+
+--------------------------------------------------------------------------
+CHANGES vs. the previous version (prediction tool wired in):
+  * new _PREDICTION_HINTS + rule_based_route now returns "prediction"
+  * route() descriptions tuple includes ("prediction", PREDICTION_TOOL_DESCRIPTION)
+  * run() has a new "3c. Prediction" block, mirroring the SQL block
+  * result dict has a new "prediction" key
+  * build_agent() auto-loads a default PredictionTool via
+    src.models.predict.get_default_prediction_tool() when none is passed in,
+    the same best-effort pattern already used for retriever/sql_tool
+--------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -30,6 +42,7 @@ from .llm import BaseLLM, get_llm
 from .prompts import (
     ANSWER_PROMPT,
     NO_TOOL_MESSAGE,
+    PREDICTION_TOOL_DESCRIPTION,
     RAG_TOOL_DESCRIPTION,
     REFUSAL_MESSAGE,
     ROUTER_PROMPT,
@@ -68,13 +81,27 @@ _RAG_STRONG_HINTS = (
 # question asks for a computation.
 _RAG_GENERIC_HINTS = (r"\bwhat (is|are|does)\b", r"\bexplain\b")
 
+# Signals that the question wants the model to predict FUTURE behavior,
+# rather than report a historical fact (sql) or a definition (rag).
+_PREDICTION_HINTS = (
+    r"\bpredict(s|ed|ion)?\b", r"\bwill\s+(this|customer|they|he|she)\b",
+    r"\blikelihood\b", r"\bprobability\b", r"\bforecast\b.*\bcustomer\b",
+    r"\brepeat purchase\b", r"\bchurn\b", r"\bexpected to\b",
+    r"\bis likely to\b",
+)
+
 
 def rule_based_route(question: str) -> tuple[list[str], str]:
     q = (question or "").lower()
     sql_score = sum(bool(re.search(p, q)) for p in _SQL_HINTS)
     strong_rag = sum(bool(re.search(p, q)) for p in _RAG_STRONG_HINTS)
     generic_rag = sum(bool(re.search(p, q)) for p in _RAG_GENERIC_HINTS)
+    prediction_score = sum(bool(re.search(p, q)) for p in _PREDICTION_HINTS)
 
+    if prediction_score and strong_rag:
+        return ["prediction", "rag"], "Question asks for a prediction and a documented definition."
+    if prediction_score:
+        return ["prediction"], "Question asks the model to predict future customer behavior."
     if strong_rag and sql_score:
         return ["sql", "rag"], "Question asks for both a figure and a definition."
     if strong_rag:
@@ -188,6 +215,7 @@ class AnalyticsAgent:
             d for t, d in (
                 ("sql", SQL_TOOL_DESCRIPTION),
                 ("rag", RAG_TOOL_DESCRIPTION),
+                ("prediction", PREDICTION_TOOL_DESCRIPTION),
             ) if t in available
         )
         prompt = ROUTER_PROMPT.format(
@@ -250,6 +278,7 @@ class AnalyticsAgent:
             "sources": [],
             "sql": None,
             "data": [],
+            "prediction": None,
             "context": "",
             "status": "success",
             "trace_id": trace_id,
@@ -350,6 +379,30 @@ class AnalyticsAgent:
                     "injection_findings": [],
                 })
 
+        # ---- 3c. Prediction ------------------------------------------------
+        if "prediction" in tools and self.prediction_tool is not None:
+            result["tools_used"].append("prediction")
+            customer_match = re.search(r"customer\s*(?:id\s*)?#?(\w+)", question, re.I)
+            customer_id = customer_match.group(1) if customer_match else None
+            pred_result = self.prediction_tool.predict(customer_id=customer_id)
+            result["prediction"] = pred_result.to_dict()
+            if pred_result.status != "success":
+                result["status"] = "error"
+            evidence_parts.append(
+                "PREDICTION EVIDENCE\n"
+                f"model_version: {pred_result.model_version}\n"
+                f"prediction: {pred_result.prediction} ({pred_result.label})\n"
+                f"probability: {pred_result.probability}\n"
+                f"features_used: {pred_result.features_used}\n"
+                f"status: {pred_result.status} {pred_result.reason}".rstrip()
+            )
+            self.audit.log({
+                "trace_id": trace_id, "event": "prediction", "question": question,
+                "status": pred_result.status, "tools_used": ["prediction"],
+                "sql": None, "reason": pred_result.reason, "n_sources": 0,
+                "latency_ms": 0.0, "injection_findings": [],
+            })
+
         # ---- 4. grounded answer -----------------------------------------
         evidence = "\n\n".join(evidence_parts) if evidence_parts else "(no evidence)"
         answer = ""
@@ -372,6 +425,9 @@ class AnalyticsAgent:
         if result.get("data"):
             lines.append("\nQuery result:")
             lines.append(json.dumps(result["data"][:10], indent=2, default=str))
+        if result.get("prediction"):
+            lines.append("\nPrediction result:")
+            lines.append(json.dumps(result["prediction"], indent=2, default=str))
         if result.get("sources"):
             lines.append("\nRelevant documentation: " + ", ".join(result["sources"]))
             lines.append(evidence[:1200])
@@ -439,6 +495,15 @@ def build_agent(
         sql_tool = SQLAnalyticsTool.from_sqlite(db_path)
     except Exception as exc:
         print(f"[build_agent] SQL tool disabled: {exc}")
+
+    if prediction_tool is None:
+        try:
+            from src.models.predict import get_default_prediction_tool
+
+            prediction_tool = get_default_prediction_tool(db_path=db_path)
+        except Exception as exc:
+            print(f"[build_agent] Prediction tool disabled: {exc}")
+            prediction_tool = None
 
     return AnalyticsAgent(
         llm=llm or get_llm(),
