@@ -4,3 +4,5 @@ matplotlib
 pytest
 scikit-learn
 python-dotenv
+scikit-learn
+python-dotenv
