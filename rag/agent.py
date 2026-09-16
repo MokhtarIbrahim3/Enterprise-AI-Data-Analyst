@@ -89,19 +89,46 @@ def rule_based_route(question: str) -> tuple[list[str], str]:
 # --------------------------------------------------------------------------- #
 # Offline SQL templates (used only when no LLM is configured)
 # --------------------------------------------------------------------------- #
+# Real schema (sql/schema.sql):
+#   customers(customer_id, country)
+#   products(stock_code, description)
+#   orders(invoice_no, customer_id, invoice_date, is_cancelled)
+#   order_items(item_id, invoice_no, stock_code, quantity, unit_price, revenue)
+#
+# Revenue lives in order_items and must be joined through orders to reach a
+# date or a customer. Cancelled orders are excluded by default everywhere —
+# this mirrors the analytics_guidelines.md convention and must not be
+# silently changed by a template edit.
+_REVENUE_JOIN = (
+    "FROM order_items oi "
+    "JOIN orders o ON o.invoice_no = oi.invoice_no "
+    "WHERE o.is_cancelled = 0"
+)
+
 _SQL_TEMPLATES: tuple[tuple[str, str], ...] = (
     (r"total revenue.*?(\d{4})",
-     "SELECT ROUND(SUM(revenue), 2) AS total_revenue FROM transactions "
-     "WHERE strftime('%Y', transaction_date) = '{0}'"),
+     "SELECT ROUND(SUM(oi.revenue), 2) AS total_revenue " + _REVENUE_JOIN +
+     " AND strftime('%Y', o.invoice_date) = '{0}'"),
     (r"(?:number of|how many) customers",
-     "SELECT COUNT(DISTINCT customer_id) AS n_customers FROM transactions"),
+     "SELECT COUNT(DISTINCT customer_id) AS n_customers FROM customers"),
+    (r"(?:number of|how many) orders.*?(\d{4})",
+     "SELECT COUNT(*) AS n_orders FROM orders "
+     "WHERE is_cancelled = 0 AND strftime('%Y', invoice_date) = '{0}'"),
     (r"top\s*(\d+)?\s*customers",
-     "SELECT customer_id, ROUND(SUM(revenue), 2) AS total_revenue FROM transactions "
-     "GROUP BY customer_id ORDER BY total_revenue DESC LIMIT {0}"),
+     "SELECT o.customer_id, ROUND(SUM(oi.revenue), 2) AS total_revenue "
+     + _REVENUE_JOIN +
+     " GROUP BY o.customer_id ORDER BY total_revenue DESC LIMIT {0}"),
     (r"monthly revenue|revenue by month|monthly sales",
-     "SELECT strftime('%Y-%m', transaction_date) AS month, "
-     "ROUND(SUM(revenue), 2) AS total_revenue FROM transactions "
-     "GROUP BY month ORDER BY month"),
+     "SELECT strftime('%Y-%m', o.invoice_date) AS month, "
+     "ROUND(SUM(oi.revenue), 2) AS total_revenue " + _REVENUE_JOIN +
+     " GROUP BY month ORDER BY month"),
+    (r"top\s*(\d+)?\s*(?:selling\s+)?products|highest quantity|best[- ]selling",
+     "SELECT oi.stock_code, p.description, SUM(oi.quantity) AS total_quantity "
+     "FROM order_items oi "
+     "JOIN orders o ON o.invoice_no = oi.invoice_no "
+     "JOIN products p ON p.stock_code = oi.stock_code "
+     "WHERE o.is_cancelled = 0 "
+     "GROUP BY oi.stock_code ORDER BY total_quantity DESC LIMIT {0}"),
 )
 
 
