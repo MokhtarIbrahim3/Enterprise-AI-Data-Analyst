@@ -2,3 +2,5 @@ pandas
 openpyxl
 matplotlib
 pytest
+scikit-learn
+python-dotenv
