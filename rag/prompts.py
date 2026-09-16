@@ -130,3 +130,20 @@ NO_TOOL_MESSAGE = (
     "That question is outside what this analyst can answer. I work from the "
     "retail transaction database and the internal business documentation."
 )
+
+
+
+
+
+# alongside SQL_TOOL_DESCRIPTION and RAG_TOOL_DESCRIPTION.
+# --------------------------------------------------------------------------- #
+ 
+PREDICTION_TOOL_DESCRIPTION = """\
+prediction: Runs a trained machine-learning model to predict a customer's
+FUTURE behavior (e.g. repeat-purchase likelihood, churn probability) given
+a customer_id. Use this tool when the question asks to predict, forecast,
+or estimate the likelihood of something happening — not for historical
+facts or aggregates (use sql) and not for definitions or policy questions
+(use rag). If the question both asks for a prediction and asks what a term
+means, use both prediction and rag."""
+ 
