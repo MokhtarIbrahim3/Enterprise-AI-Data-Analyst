@@ -1,4 +1,3 @@
-
 """
 Build data/retail.db from data/sample.csv.
 
@@ -14,9 +13,17 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import sys
 from pathlib import Path
 
 import pandas as pd
+
+# Make the repo root importable regardless of the current working directory
+# or how this script is invoked (this is what "ModuleNotFoundError: No
+# module named 'src'" means — Python only looks in the script's own folder
+# unless we add the repo root ourselves).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 from src.data.loader import clean_data, validate_data
 
